@@ -1,1 +1,2 @@
-# Sign-Language
+# Training CNN model
+### Recognize various sign languages
