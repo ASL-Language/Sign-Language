@@ -123,16 +123,17 @@ class HandMarker:
             # Draw gesture if detected
             if gesture_result and gesture_result.gestures:
                 gesture = gesture_result.gestures[idx][0]  # Get the gesture for the corresponding hand
-                cv2.putText(
-                    annotated_image,
-                    f"Gesture: {gesture.category_name} ({gesture.score:.2f})",
-                    (text_x, text_y + TEXT_VERTICAL_OFFSET),
-                    cv2.FONT_HERSHEY_DUPLEX,
-                    FONT_SIZE,
-                    GESTURE_TEXT_COLOR,
-                    FONT_THICKNESS,
-                    cv2.LINE_AA,
-                )
+                if gesture.score >= 0.85:
+                    cv2.putText(
+                        annotated_image,
+                        f"Gesture: {gesture.category_name} ({gesture.score:.2f})",
+                        (text_x, text_y + TEXT_VERTICAL_OFFSET),
+                        cv2.FONT_HERSHEY_DUPLEX,
+                        FONT_SIZE,
+                        GESTURE_TEXT_COLOR,
+                        FONT_THICKNESS,
+                        cv2.LINE_AA,
+                    )
 
         # Draw text at the bottom of the image
         if text:
@@ -154,6 +155,7 @@ class HandMarker:
             gestures = [
                 f"{gesture.category_name}"
                 for gesture in gesture_result.gestures[0]
+                if gesture.score >= 0.85
             ]
             return " ".join(gestures)
         return ""
