@@ -43,7 +43,7 @@ class HandMarker:
     def __init__(self, model_path="./models/hand_landmarker.task"):
         self.model_path = model_path
         self.hand_landmarker = self._initialize_hand_landmarker()
-
+        self.previous_gesture=""
     def _initialize_hand_landmarker(self):
         BaseOptions = mp.tasks.BaseOptions
         HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -121,19 +121,20 @@ class HandMarker:
             )
 
             # Draw gesture if detected
-            if gesture_result and gesture_result.gestures:
+        if gesture_result and gesture_result.gestures:
                 gesture = gesture_result.gestures[idx][0]  # Get the gesture for the corresponding hand
                 if gesture.score >= 0.85:
-                    cv2.putText(
-                        annotated_image,
-                        f"Gesture: {gesture.category_name} ({gesture.score:.2f})",
-                        (text_x, text_y + TEXT_VERTICAL_OFFSET),
-                        cv2.FONT_HERSHEY_DUPLEX,
-                        FONT_SIZE,
-                        GESTURE_TEXT_COLOR,
-                        FONT_THICKNESS,
-                        cv2.LINE_AA,
-                    )
+                    self.previous_gesture = gesture.category_name
+                cv2.putText(
+                    annotated_image,
+                    f"Gesture: {self.previous_gesture} ({gesture.score:.2f})",
+                    (text_x, text_y + TEXT_VERTICAL_OFFSET),
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    FONT_SIZE,
+                    GESTURE_TEXT_COLOR,
+                    FONT_THICKNESS,
+                    cv2.LINE_AA,
+                )
 
         # Draw text at the bottom of the image
         if text:
