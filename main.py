@@ -4,18 +4,23 @@ from mediapipe import solutions
 from mediapipe.framework.formats import landmark_pb2
 import numpy as np
 import time
-import psutil
-import torch
-import ctranslate2
-import pyonmttok
-from huggingface_hub import snapshot_download
+from collections import defaultdict
 from wordsegment import load, segment
 from punctfix import PunctFixer
 from spellchecker import SpellChecker
-from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
+import psutil
+from transformers import AutoTokenizer
+from huggingface_hub import snapshot_download
+import ctranslate2
+import pyonmttok
+import re
+
+ctranslate2_translator = None
+pyonmttok_tokenizer = None
 
 class Recognizer:
-    def __init__(self, model_path="./models/gesture_recognizer.task"):
+    def __init__(self, model_path="./models/gesture_recognizer-1_1.task"):
         self.model_path = model_path
         self.recognizer = self._initialize_recognizer()
 
@@ -43,7 +48,7 @@ class HandMarker:
     def __init__(self, model_path="./models/hand_landmarker.task"):
         self.model_path = model_path
         self.hand_landmarker = self._initialize_hand_landmarker()
-        self.previous_gesture=""
+
     def _initialize_hand_landmarker(self):
         BaseOptions = mp.tasks.BaseOptions
         HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -79,12 +84,10 @@ class HandMarker:
         handedness_list = detection_result.handedness if detection_result else []
         annotated_image = np.copy(rgb_image)
 
-        # Loop through the detected hands to visualize.
         for idx in range(len(hand_landmarks_list)):
             hand_landmarks = hand_landmarks_list[idx]
             handedness = handedness_list[idx]
 
-            # Draw the hand landmarks.
             hand_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
             hand_landmarks_proto.landmark.extend(
                 [
@@ -102,13 +105,11 @@ class HandMarker:
                 mp.solutions.drawing_styles.get_default_hand_connections_style(),
             )
 
-            # Get the top left corner of the detected hand's bounding box.
             x_coordinates = [landmark.x for landmark in hand_landmarks]
             y_coordinates = [landmark.y for landmark in hand_landmarks]
             text_x = int(min(x_coordinates) * width)
             text_y = int(min(y_coordinates) * height) - MARGIN
 
-            # Draw handedness (left or right hand) on the image.
             cv2.putText(
                 annotated_image,
                 f"{handedness[0].category_name}",
@@ -120,23 +121,19 @@ class HandMarker:
                 cv2.LINE_AA,
             )
 
-            # Draw gesture if detected
         if gesture_result and gesture_result.gestures:
-                gesture = gesture_result.gestures[idx][0]  # Get the gesture for the corresponding hand
-                if gesture.score >= 0.85:
-                    self.previous_gesture = gesture.category_name
-                cv2.putText(
-                    annotated_image,
-                    f"Gesture: {self.previous_gesture} ({gesture.score:.2f})",
-                    (text_x, text_y + TEXT_VERTICAL_OFFSET),
-                    cv2.FONT_HERSHEY_DUPLEX,
-                    FONT_SIZE,
-                    GESTURE_TEXT_COLOR,
-                    FONT_THICKNESS,
-                    cv2.LINE_AA,
-                )
+            gesture = gesture_result.gestures[0][0]  # Get the gesture for the corresponding hand
+            cv2.putText(
+                annotated_image,
+                f"Gesture: {gesture.category_name} ({gesture.score:.2f})",
+                (text_x, text_y + TEXT_VERTICAL_OFFSET),
+                cv2.FONT_HERSHEY_DUPLEX,
+                FONT_SIZE,
+                GESTURE_TEXT_COLOR,
+                FONT_THICKNESS,
+                cv2.LINE_AA,
+            )
 
-        # Draw text at the bottom of the image
         if text:
             cv2.putText(
                 annotated_image,
@@ -156,7 +153,7 @@ class HandMarker:
             gestures = [
                 f"{gesture.category_name}"
                 for gesture in gesture_result.gestures[0]
-                if gesture.score >= 0.85
+                if gesture.score >= 0.6
             ]
             return " ".join(gestures)
         return ""
@@ -167,61 +164,67 @@ class OpenCamera:
         self.detector = HandMarker()
         self.recognizer = Recognizer()
         self.time = 0
-        self.cumulative_text = ""  # Variable to store cumulative text
-        self.last_detection_time = time.time()  # Time of the last hand detection
+        self.cumulative_text = ""
+        self.last_detection_time = time.time()
+        self.frame_counter = 0
+        self.gesture_dict = defaultdict(int)  # Dictionary to store gesture counts
+        self.window_size = 10  # Window size for moving average
         self.connect()
+
+    def moving_average_filter(self):
+        # 使用 numpy 計算滑動平均
+        gestures = np.array(list(self.gesture_dict.values()))
+        if gestures.size == 0:
+            return None
+        most_common_gesture_index = np.argmax(gestures)
+        most_common_gesture = list(self.gesture_dict.keys())[most_common_gesture_index]
+        return most_common_gesture
 
     def connect(self):
         if not self.cap.isOpened():
             print("Error: Cannot open camera")
             exit()
-        prev=""
-        repeat_time=0
+
+        check_tran = 1
         while True:
-            self.time += 1
             ret, frame = self.cap.read()
             if not ret:
                 print("Error: Can't receive frame (stream end?). Exiting...")
                 break
 
-            # Detect hands synchronously
+            self.frame_counter += 1
             hand_landmarker_result = self.detector.detect(frame)
             gesture_result = self.recognizer.recognize(frame) if hand_landmarker_result else None
-
-            # Convert gesture result to text
             gesture_text = self.detector.gesture_to_text(gesture_result)
+            if gesture_text:
+                self.gesture_dict[gesture_text] += 1  # Increment the count for this gesture
+                self.last_detection_time=time.time()
 
-            # Translate text using the model
-            if gesture_text :  # Ensure gesture_text is not empty
-                if gesture_text==prev:
-                    repeat_time+=1
-                else:
-                    repeat_time=0
-                prev=gesture_text
-                self.last_detection_time = time.time()
-                if repeat_time==3:
-                    if gesture_text=="space":
-                        gesture_text=" "
-                    self.cumulative_text+=gesture_text
-                    prev=""
-                    print(self.cumulative_text)
-                    
-                
-            if self.cumulative_text:
-                translated_text, _, _ = translate_batch_with_model([self.cumulative_text])
-                self.cumulative_text = translated_text[0] if translated_text else ""
-            # Clear cumulative text if no hand detected for 5 seconds
-            if time.time() - self.last_detection_time > 5:
-                self.cumulative_text = ""
-                prev=""
+            if self.frame_counter % self.window_size == 0:
+                most_common_gesture = self.moving_average_filter()
+                if most_common_gesture == "space":
+                    most_common_gesture = " "
+                self.cumulative_text += most_common_gesture if most_common_gesture else ""
+                self.gesture_dict.clear()  # Reset the dictionary for the next window
 
+                #print("Most common gesture in the last 5 frames:", most_common_gesture)
+                #print("Cumulative text so far:", self.cumulative_text)
+                #prev = most_common_gesture  # Update prev to track changes
+            #print(time.time() - self.last_detection_time )
+            # 新增：當偵測到是空白或時間差距大於3秒，丟給語言函式執行一次
+            if self.cumulative_text and (most_common_gesture == " " or time.time() - self.last_detection_time > 3) and check_tran:
+                self.cumulative_text = process_text_in_sequence(self.cumulative_text)
+                check_tran = 0
 
             if hand_landmarker_result:
-                # Draw landmarks and gestures on the frame
                 mark_image = self.detector.draw_image(frame, hand_landmarker_result, gesture_result, self.cumulative_text)
                 cv2.imshow("Live", mark_image)
             else:
                 cv2.imshow("Live", frame)
+
+            if time.time() - self.last_detection_time > 5:
+                self.cumulative_text = ""
+                check_tran = 1
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 self.end()
@@ -231,31 +234,6 @@ class OpenCamera:
         self.cap.release()
         cv2.destroyAllWindows()
 
-# 加载 wordsegment 数据
-load()
-
-# 初始化拼写检查器
-spell = SpellChecker()
-
-# 初始化 PunctFixer，只需要初始化一次
-punct_fixer = PunctFixer()
-
-# 初始化全局变量以缓存模型和分词器
-ctranslate2_translator = None
-pyonmttok_tokenizer = None
-
-def process_text_with_model(text):
-    # 使用 wordsegment 处理文本
-    text = ' '.join(segment(text))
-
-    # 使用 spellchecker 进行拼写纠正
-    '''
-    words = text.split()
-    misspelled = spell.unknown(words)
-    corrected_words = [spell.correction(word) if spell.correction(word) is not None else word for word in words]
-    text = ' '.join(corrected_words)
-    '''
-    return text
 
 def initialize_model():
     global ctranslate2_translator, pyonmttok_tokenizer
@@ -272,40 +250,103 @@ def initialize_model():
     # 初始化 CTranslate2 翻译器，启用多线程
     ctranslate2_translator = ctranslate2.Translator(model_dir, device=device, inter_threads=4, intra_threads=4)
 
-def translate_batch_with_model(texts):
-    global ctranslate2_translator, pyonmttok_tokenizer
 
-    # 处理输入文本，使用多线程进行并行处理
-    with ThreadPoolExecutor() as executor:
-        processed_texts = list(executor.map(process_text_with_model, texts))
+# 加载 wordsegment 数据
+load()
 
-    # 测量开始时间和初始内存使用情况
-    start_time = time.time()
-    start_memory = psutil.Process().memory_info().rss
+# 初始化拼写检查器
+spell = SpellChecker()
 
-    # Tokenize and translate the processed texts
-    '''
-    tokenized_batch = [pyonmttok_tokenizer.tokenize(text)[0] for text in processed_texts]
-    translated_batch = ctranslate2_translator.translate_batch(tokenized_batch)
-    gec_corrected_texts = [pyonmttok_tokenizer.detokenize(translated.hypotheses[0]) for translated in translated_batch]
-    '''
-    # 使用 punctfix 处理标点符号，使用多线程进行并行处理
-    with ThreadPoolExecutor() as executor:
-        #punctuated_texts = list(executor.map(punct_fixer.punctuate, gec_corrected_texts))
-        punctuated_texts = list(executor.map(punct_fixer.punctuate, processed_texts))
-    # 测量结束时间和最终内存使用情况
-    end_time = time.time()
-    end_memory = psutil.Process().memory_info().rss
+# 初始化 PunctFixer，只需要初始化一次
+punct_fixer = PunctFixer()
 
-    # 计算时间和内存使用情况
-    time_taken = end_time - start_time
-    memory_used = end_memory - start_memory
-
-    return punctuated_texts, time_taken, memory_used
-
-# 初始化模型
+#GEC
 initialize_model()
 
+def process_text_with_wordsegment(text):
+    if text == "":
+        return text
+    return ' '.join(segment(text))
+
+def process_text_with_spellchecker(text):
+    if text == "":
+        return text
+    words = text.split()
+    misspelled = spell.unknown(words)
+    corrected_words = [spell.correction(word) if spell.correction(word) is not None else word for word in words]
+    return ' '.join(corrected_words)
+
+def process_text_with_punctfix(text):
+    if text == "":
+        return text
+    return punct_fixer.punctuate(text)
+
+def process_text_with_gec(text):
+    """
+    使用 GEC 模型进行校正。
+    """
+    # 分词
+    tokenized_text = pyonmttok_tokenizer.tokenize(text)[0]
+
+    # 翻译校正
+    translated_batch = ctranslate2_translator.translate_batch([tokenized_text])
+    gec_corrected_text = pyonmttok_tokenizer.detokenize(translated_batch[0].hypotheses[0])
+
+    return gec_corrected_text
+
+def remove_single_letters_except_ai(text):
+    """
+    移除句子中单独的字母，除了 'a' 和 'i' 之外。
+    """
+    # 使用正则表达式匹配单独的字母，前后可能有空格或标点符号
+    text = re.sub(r'\b[b-hj-zB-HJ-Z]\b', '', text)
+    return re.sub(r'\s{2,}', ' ', text).strip()  # 移除多余的空格
+
+def safe_process(func, text):
+    """
+    安全地执行语言处理函数，确保不会返回 None。
+    """
+    result = func(text)
+    return result if result is not None else text
+#順序不保證
+'''
+def process_text_multithreaded(text):
+    """
+    使用多线程来同时运行语言处理函数，并在最后一步进行 GEC 校正。
+    """
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {
+            executor.submit(safe_process, process_text_with_wordsegment, text): "wordsegment",
+            executor.submit(safe_process, process_text_with_spellchecker, text): "spellchecker",
+            executor.submit(safe_process, process_text_with_punctfix, text): "punctfix",
+            executor.submit(safe_process, process_text_with_gec, text): "gec"
+        }
+        for future in concurrent.futures.as_completed(futures):
+            text = future.result()
+            print(f"{futures[future]}: {text}")
+    
+    return text
+'''
+def process_text_in_sequence(text):
+    """
+    顺序执行语言处理函数，确保按照指定顺序处理文本。
+    """
+    text = safe_process(process_text_with_wordsegment, text)
+    print("wordsegment: ", text)
+
+    text = safe_process(process_text_with_spellchecker, text)
+    print("spellchecker: ", text)
+
+    text = safe_process(process_text_with_punctfix, text)
+    print("punctfix: ", text)
+
+    text = safe_process(remove_single_letters_except_ai, text)
+    print("after removing single letters: ", text)
+
+    text = safe_process(process_text_with_gec, text)
+    print("gec: ", text)
+    
+    return text
 # Example usage:
 if __name__ == "__main__":
     OpenCamera()
